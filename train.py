@@ -22,9 +22,9 @@ from utils import plotting
 # -----------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
 # data I/O
-parser.add_argument('-i', '--data_dir', type=str, default='/local_home/tim/pxpp/data', help='Location for the dataset')
-parser.add_argument('-o', '--save_dir', type=str, default='/local_home/tim/pxpp/save', help='Location for parameter checkpoints and samples')
-parser.add_argument('-d', '--data_set', type=str, default='cifar', help='Can be either cifar|imagenet')
+parser.add_argument('-i', '--data_dir', type=str, default='data/', help='Location for the dataset')
+parser.add_argument('-o', '--save_dir', type=str, default='logs/', help='Location for parameter checkpoints and samples')
+parser.add_argument('-d', '--data_set', type=str, default='cifar100', help='Can be either cifar100|cifar10|imagenet')
 parser.add_argument('-t', '--save_interval', type=int, default=20, help='Every how many epochs to write checkpoint/samples?')
 parser.add_argument('-r', '--load_params', dest='load_params', action='store_true', help='Restore training from previous model checkpoint?')
 # model
@@ -64,9 +64,12 @@ else:
 # initialize data loaders for train/test splits
 if args.data_set == 'imagenet' and args.class_conditional:
     raise("We currently don't have labels for the small imagenet data set")
-if args.data_set == 'cifar':
+if args.data_set == 'cifar10':
     import data.cifar10_data as cifar10_data
     DataLoader = cifar10_data.DataLoader
+elif args.data_set == 'cifar100':
+    import data.cifar100_data as cifar100_data
+    DataLoader = cifar100_data.DataLoader
 elif args.data_set == 'imagenet':
     import data.imagenet_data as imagenet_data
     DataLoader = imagenet_data.DataLoader

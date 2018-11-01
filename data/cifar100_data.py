@@ -73,7 +73,7 @@ class DataLoader(object):
             os.makedirs(data_dir)
 
         # load CIFAR-100 training data to RAM
-        self.data, self.labels = load(os.path.join(data_dir,'cifar-100-python'), subset=subset)
+        self.data, self.labels = load(data_dir, subset=subset)
         self.data = np.transpose(self.data, (0,2,3,1)) # (N,3,32,32) -> (N,32,32,3)
 
         self.p = 0 # pointer to where we are in iteration
