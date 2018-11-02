@@ -41,7 +41,6 @@ parser.add_argument('-b', '--batch_size', type=int, default=16, help='Batch size
 parser.add_argument('-u', '--init_batch_size', type=int, default=16, help='How much data to use for data-dependent initialization.')
 parser.add_argument('-p', '--dropout_p', type=float, default=0.5, help='Dropout strength (i.e. 1 - keep_prob). 0 = No dropout, higher = more dropout.')
 parser.add_argument('-x', '--max_epochs', type=int, default=5000, help='How many epochs to run in total?')
-parser.add_argument('-g', '--nr_gpu', type=int, default=8, help='How many GPUs to distribute the training across?')
 # evaluation
 parser.add_argument('--polyak_decay', type=float, default=0.9995, help='Exponential decay rate of the sum of previous model iterates during Polyak averaging')
 parser.add_argument('-ns', '--num_samples', type=int, default=1, help='How many batches of samples to output.')
@@ -75,28 +74,25 @@ elif args.data_set == 'imagenet':
     DataLoader = imagenet_data.DataLoader
 else:
     raise("unsupported dataset")
-train_data = DataLoader(args.data_dir, 'train', args.batch_size * args.nr_gpu, rng=rng, shuffle=True, return_labels=args.class_conditional)
-test_data = DataLoader(args.data_dir, 'test', args.batch_size * args.nr_gpu, shuffle=False, return_labels=args.class_conditional)
+train_data = DataLoader(args.data_dir, 'train', args.batch_size, rng=rng, shuffle=True, return_labels=args.class_conditional)
+test_data = DataLoader(args.data_dir, 'test', args.batch_size, shuffle=False, return_labels=args.class_conditional)
 obs_shape = train_data.get_observation_size() # e.g. a tuple (32,32,3)
 assert len(obs_shape) == 3, 'assumed right now'
 
 # data place holders
 x_init = tf.placeholder(tf.float32, shape=(args.init_batch_size,) + obs_shape)
-xs = [tf.placeholder(tf.float32, shape=(args.batch_size, ) + obs_shape) for i in range(args.nr_gpu)]
+xs = tf.placeholder(tf.float32, shape=(args.batch_size, ) + obs_shape)
 
 # if the model is class-conditional we'll set up label placeholders + one-hot encodings 'h' to condition on
 if args.class_conditional:
     num_labels = train_data.get_num_labels()
     y_init = tf.placeholder(tf.int32, shape=(args.init_batch_size,))
     h_init = tf.one_hot(y_init, num_labels)
-    y_sample = np.split(np.mod(np.arange(args.batch_size*args.nr_gpu), num_labels), args.nr_gpu)
-    h_sample = [tf.one_hot(tf.Variable(y_sample[i], trainable=False), num_labels) for i in range(args.nr_gpu)]
-    ys = [tf.placeholder(tf.int32, shape=(args.batch_size,)) for i in range(args.nr_gpu)]
-    hs = [tf.one_hot(ys[i], num_labels) for i in range(args.nr_gpu)]
+    ys = tf.placeholder(tf.int32, shape=(args.batch_size,))
+    hs = tf.one_hot(ys, num_labels)
 else:
     h_init = None
-    h_sample = [None] * args.nr_gpu
-    hs = h_sample
+    hs = None
 
 # create the model
 model_opt = { 'nr_resnet': args.nr_resnet, 'nr_filters': args.nr_filters, 'nr_logistic_mix': args.nr_logistic_mix, 'resnet_nonlinearity': args.resnet_nonlinearity, 'energy_distance': args.energy_distance }
@@ -111,55 +107,41 @@ ema = tf.train.ExponentialMovingAverage(decay=args.polyak_decay)
 maintain_averages_op = tf.group(ema.apply(all_params))
 ema_params = [ema.average(p) for p in all_params]
 
-# get loss gradients over multiple GPUs + sampling
-grads = []
-loss_gen = []
-loss_gen_test = []
-new_x_gen = []
-for i in range(args.nr_gpu):
-    with tf.device('/gpu:%d' % i):
-        # train
-        out = model(xs[i], hs[i], ema=None, dropout_p=args.dropout_p, **model_opt)
-        loss_gen.append(loss_fun(tf.stop_gradient(xs[i]), out))
+# train
+out = model(xs, hs, ema=None, dropout_p=args.dropout_p, **model_opt)
+loss_gen = loss_fun(tf.stop_gradient(xs), out)
 
-        # gradients
-        grads.append(tf.gradients(loss_gen[i], all_params, colocate_gradients_with_ops=True))
+# gradients
+grads = tf.gradients(loss_gen, all_params, colocate_gradients_with_ops=True)
 
-        # test
-        out = model(xs[i], hs[i], ema=ema, dropout_p=0., **model_opt)
-        loss_gen_test.append(loss_fun(xs[i], out))
+# test
+out = model(xs, hs, ema=ema, dropout_p=0., **model_opt)
+loss_gen_test = loss_fun(xs, out)
 
-        # sample
-        out = model(xs[i], h_sample[i], ema=ema, dropout_p=0, **model_opt)
-        if args.energy_distance:
-            new_x_gen.append(out[0])
-        else:
-            new_x_gen.append(nn.sample_from_discretized_mix_logistic(out, args.nr_logistic_mix))
+# sample
+out = model(xs, hs, ema=ema, dropout_p=0, **model_opt)
+if args.energy_distance:
+    new_x_gen = out[0]
+else:
+    new_x_gen = nn.sample_from_discretized_mix_logistic(out, args.nr_logistic_mix)
 
 # add losses and gradients together and get training updates
 tf_lr = tf.placeholder(tf.float32, shape=[])
-with tf.device('/gpu:0'):
-    for i in range(1,args.nr_gpu):
-        loss_gen[0] += loss_gen[i]
-        loss_gen_test[0] += loss_gen_test[i]
-        for j in range(len(grads[0])):
-            grads[0][j] += grads[i][j]
-    # training op
-    optimizer = tf.group(nn.adam_updates(all_params, grads[0], lr=tf_lr, mom1=0.95, mom2=0.9995), maintain_averages_op)
+# training op
+optimizer = tf.group(nn.adam_updates(all_params, grads, lr=tf_lr, mom1=0.95, mom2=0.9995), maintain_averages_op)
 
 # convert loss to bits/dim
-bits_per_dim = loss_gen[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*args.batch_size)
-bits_per_dim_test = loss_gen_test[0]/(args.nr_gpu*np.log(2.)*np.prod(obs_shape)*args.batch_size)
+bits_per_dim = loss_gen/(np.log(2.)*np.prod(obs_shape))
+bits_per_dim_test = loss_gen_test/(np.log(2.)*np.prod(obs_shape))
 
 # sample from the model
 def sample_from_model(sess):
-    x_gen = [np.zeros((args.batch_size,) + obs_shape, dtype=np.float32) for i in range(args.nr_gpu)]
+    x_gen = np.zeros((args.batch_size,) + obs_shape, dtype=np.float32)
     for yi in range(obs_shape[0]):
         for xi in range(obs_shape[1]):
-            new_x_gen_np = sess.run(new_x_gen, {xs[i]: x_gen[i] for i in range(args.nr_gpu)})
-            for i in range(args.nr_gpu):
-                x_gen[i][:,yi,xi,:] = new_x_gen_np[i][:,yi,xi,:]
-    return np.concatenate(x_gen, axis=0)
+            new_x_gen_np = sess.run(new_x_gen, {xs: x_gen})
+            x_gen[:,yi,xi,:] = new_x_gen_np[:,yi,xi,:]
+    return x_gen
 
 # init & save
 initializer = tf.global_variables_initializer()
@@ -178,11 +160,9 @@ def make_feed_dict(data, init=False):
         if y is not None:
             feed_dict.update({y_init: y})
     else:
-        x = np.split(x, args.nr_gpu)
-        feed_dict = {xs[i]: x[i] for i in range(args.nr_gpu)}
+        feed_dict = {xs: x}
         if y is not None:
-            y = np.split(y, args.nr_gpu)
-            feed_dict.update({ys[i]: y[i] for i in range(args.nr_gpu)})
+            feed_dict.update({ys: y})
     return feed_dict
 
 # //////////// perform training //////////////
