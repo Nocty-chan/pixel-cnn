@@ -134,6 +134,11 @@ optimizer = tf.group(nn.adam_updates(all_params, grads, lr=tf_lr, mom1=0.95, mom
 bits_per_dim = loss_gen/(np.log(2.)*np.prod(obs_shape))
 bits_per_dim_test = loss_gen_test/(np.log(2.)*np.prod(obs_shape))
 
+tf.summary.scalar("Loss", loss_gen / args.batch_size)
+tf.summary.scalar("BPD", bits_per_dim / args.batch_size)
+tf.summary.scalar("Learning rate", tf_lr)
+summary = tf.summary.merge_all()
+
 # sample from the model
 def sample_from_model(sess):
     x_gen = np.zeros((args.batch_size,) + obs_shape, dtype=np.float32)
@@ -171,6 +176,8 @@ if not os.path.exists(args.save_dir):
 test_bpd = []
 lr = args.learning_rate
 with tf.Session() as sess:
+    writer = tf.summary.FileWriter(args.save_dir + '/train', sess.graph)
+    test_writer = tf.summary.FileWriter(args.save_dir + '/test', sess.graph)
     for epoch in range(args.max_epochs):
         begin = time.time()
 
@@ -195,8 +202,10 @@ with tf.Session() as sess:
             # forward/backward/update model on each gpu
             lr *= args.lr_decay
             feed_dict.update({ tf_lr: lr })
-            l,_ = sess.run([bits_per_dim, optimizer], feed_dict)
+            sum_, l,_ = sess.run([summary, bits_per_dim, optimizer], feed_dict)
+            writer.add_summary(sum_, counter)
             train_losses.append(l)
+
         train_loss_gen = np.mean(train_losses)
 
         # compute likelihood over test data
@@ -208,23 +217,25 @@ with tf.Session() as sess:
         test_loss_gen = np.mean(test_losses)
         test_bpd.append(test_loss_gen)
 
+        test_summary = tf.Summary(value=[
+            tf.Summary.Value(tag="BPD", simple_value=test_loss_gen / args.batch_size)])
+        test_writer.add_summary(test_summary, counter)
+
+
         # log progress to console
-        print("Iteration %d, time = %ds, train bits_per_dim = %.4f, test bits_per_dim = %.4f" % (epoch, time.time()-begin, train_loss_gen, test_loss_gen))
+        print("Iteration %d, time = %ds, train bits_per_dim = %.4f, test bits_per_dim = %.4f" % (
+            epoch, time.time()-begin, train_loss_gen / args.batch_size, test_loss_gen / args.batch_size))
         sys.stdout.flush()
 
-        if epoch % args.save_interval == 0:
 
-            # generate samples from the model
-            sample_x = []
-            for i in range(args.num_samples):
-                sample_x.append(sample_from_model(sess))
-            sample_x = np.concatenate(sample_x,axis=0)
-            img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=True)
-            img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
-            plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
-            plotting.plt.close('all')
-            np.savez(os.path.join(args.save_dir,'%s_sample%d.npz' % (args.data_set, epoch)), sample_x)
-
-            # save params
-            saver.save(sess, args.save_dir + '/params_' + args.data_set + '.ckpt')
-            np.savez(args.save_dir + '/test_bpd_' + args.data_set + '.npz', test_bpd=np.array(test_bpd))
+        # generate samples from the model
+        sample_x = []
+        for i in range(args.num_samples):
+            sample_x.append(sample_from_model(sess))
+        sample_x = np.concatenate(sample_x,axis=0)
+        img_tile = plotting.img_tile(sample_x[:100], aspect_ratio=1.0, border_color=1.0, stretch=True)
+        img = plotting.plot_img(img_tile, title=args.data_set + ' samples')
+        plotting.plt.savefig(os.path.join(args.save_dir,'%s_sample%d.png' % (args.data_set, epoch)))
+        plotting.plt.close('all')
+        # save params
+        saver.save(sess, args.save_dir + '/params_' + args.data_set + '.ckpt')
